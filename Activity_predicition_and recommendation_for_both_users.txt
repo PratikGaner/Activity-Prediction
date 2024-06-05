@@ -1,0 +1,257 @@
+import pandas as pd
+import numpy as np
+import random
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import classification_report
+from collections import Counter
+
+def align_sequences(activity_sequences, sensor_sequences):
+    aligned_sequences = []
+    for activity_seq in activity_sequences:
+        activity_start_time = activity_seq['start_time']
+        activity_end_time = activity_seq['end_time']
+        aligned_sensor_readings = []
+        for sensor_seq in sensor_sequences:
+            sensor_start_time = sensor_seq['start_time']
+            sensor_end_time = sensor_seq['end_time']
+            if sensor_start_time >= activity_start_time and sensor_end_time <= activity_end_time:
+                aligned_sensor_readings.append(sensor_seq)
+        if aligned_sensor_readings:
+            aligned_sequences.append({
+                'activity': activity_seq['activity'],
+                'activity_start_time': activity_start_time,
+                'activity_end_time': activity_end_time,
+                'sensor_readings': aligned_sensor_readings
+            })
+    return aligned_sequences
+
+def preprocess_data(activity_df, sensor_df, user_id):
+    activity_sequences = []
+    for index, row in activity_df.iterrows():
+        activity_sequences.append({
+            'start_time': row['Start time'],
+            'end_time': row['End time'],
+            'activity': row['Activity']
+        })
+
+    sensor_sequences = []
+    for index, row in sensor_df.iterrows():
+        sensor_sequences.append({
+            'start_time': row['Start time'],
+            'end_time': row['End time'],
+            'location': row['Location'],
+            'type': row['Type'],
+            'place': row['Place']
+        })
+
+    aligned_sequences = align_sequences(activity_sequences, sensor_sequences)
+
+    data = []
+    for seq in aligned_sequences:
+        activity = seq['activity']
+        activity_start_time = seq['activity_start_time']
+        activity_end_time = seq['activity_end_time']
+        for sensor_reading in seq['sensor_readings']:
+            reading_start_time = sensor_reading['start_time']
+            reading_end_time = sensor_reading['end_time']
+            data.append({
+                'user_id': user_id,
+                'activity': activity,
+                'activity_start_time': activity_start_time,
+                'activity_end_time': activity_end_time,
+                'location': sensor_reading['location'],
+                'type': sensor_reading['type'],
+                'place': sensor_reading['place']
+            })
+
+    return pd.DataFrame(data)
+
+def compute_class_weights(y):
+    class_weights = {}
+    class_counts = np.bincount(y)
+    total_samples = len(y)
+    for i, count in enumerate(class_counts):
+        class_weights[i] = total_samples / (len(np.unique(y)) * count)
+    return class_weights
+
+def train_predict_recommend(users_data):
+    models = {}
+
+    for user_id, (activity_df, sensor_df) in enumerate(users_data, start=1):
+        # Preprocess data
+        combined_df = preprocess_data(activity_df, sensor_df, user_id)
+
+        # One-hot encode categorical features
+        encoder = OneHotEncoder()
+        encoded_features = encoder.fit_transform(combined_df[['activity', 'location', 'type', 'place']])
+        encoded_feature_names = encoder.get_feature_names_out(['activity', 'location', 'type', 'place'])
+        encoded_df = pd.DataFrame(encoded_features.toarray(), columns=encoded_feature_names)
+
+        combined_df = pd.concat([combined_df, encoded_df], axis=1)
+
+        selected_features = ['user_id', 'activity_start_time', 'activity_end_time'] + list(encoded_feature_names)
+
+        X = combined_df[selected_features]
+        y = combined_df['activity']
+
+        scaler = StandardScaler()
+        X.loc[:,['activity_start_time', 'activity_end_time']] = scaler.fit_transform(X[['activity_start_time', 'activity_end_time']])
+
+        # Train-test split
+        X_train, X_val, y_train, y_val = train_test_split(X.drop(columns=['user_id']), y, test_size=0.2, stratify=y, random_state=42)
+
+        label_encoder = LabelEncoder()
+        y_train_encoded = label_encoder.fit_transform(y_train)
+        y_val_encoded = label_encoder.transform(y_val)
+
+        # Calculate weights for each class based on their frequency
+        class_weights = compute_class_weights(y_train_encoded)
+
+        # Define model architecture
+        model = Sequential([
+            LSTM(units=128, input_shape=(X_train.shape[1], 1)),
+            Dropout(0.2),
+            Dense(units=len(np.unique(y)), activation='softmax')
+        ])
+
+        # Compile model
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+        # Define EarlyStopping callback
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5)
+
+        # Train model
+        history = model.fit(X_train.values.reshape(X_train.shape[0], X_train.shape[1], 1), y_train_encoded,
+                            epochs=50,
+                            batch_size=32,
+                            class_weight=class_weights,
+                            validation_data=(X_val.values.reshape(X_val.shape[0], X_val.shape[1], 1), y_val_encoded),
+                            callbacks=[early_stopping])
+
+        models[user_id] = model
+
+        # Get predictions on validation data
+        y_val_pred = model.predict(X_val.values.reshape(X_val.shape[0], X_val.shape[1], 1))
+        y_val_pred = np.argmax(y_val_pred, axis=1)
+
+        # Inverse transform encoded labels to original labels
+        y_val_true = label_encoder.inverse_transform(y_val_encoded)
+        y_val_pred = label_encoder.inverse_transform(y_val_pred)
+
+        # Print classification report for activities
+        print(f"Classification Report for User {user_id} - Activity:")
+        print(classification_report(y_val_true, y_val_pred))
+        print()
+
+        # Predict next activity and recommend type, place, and location
+        last_activity_encoded = y_train_encoded[-1]
+        next_activity_probabilities = model.predict(X_train.values[-1].reshape(1, X_train.shape[1], 1))[0]
+        next_activity_encoded = np.argmax(next_activity_probabilities)
+
+        next_activity = label_encoder.inverse_transform([next_activity_encoded])[0]
+
+        # Filter user's data to include only entries corresponding to the predicted activity
+        predicted_activity_data = combined_df[combined_df['activity'] == next_activity]
+
+        if not predicted_activity_data.empty:
+            # Extract historical patterns for the predicted activity
+            patterns = find_patterns(predicted_activity_data)
+
+            # Rank recommendations based on historical patterns
+            ranked_activity, ranked_type, ranked_place, ranked_location = rank_recommendations_based_on_pattern(next_activity, patterns)
+
+            print(f"User {user_id} - Predicted Next Activity: {next_activity}, "
+                  f"Recommended Type: {ranked_type}, Recommended Place: {ranked_place}, "
+                  f"Recommended Location: {ranked_location}")
+
+            # Find the actual activity, type, place, and location corresponding to the predicted activity
+            actual_activity_data = combined_df[combined_df['activity'] == next_activity]
+            actual_activity = actual_activity_data['activity'].iloc[0]
+            actual_type = actual_activity_data['type'].iloc[0]
+            actual_place = actual_activity_data['place'].iloc[0]
+            actual_location = actual_activity_data['location'].iloc[0]
+
+            print(f"Actual Activity: {actual_activity}, Actual Type: {actual_type}, Actual Place: {actual_place}, Actual Location: {actual_location}")
+
+            # Evaluate type recommendation
+            type_recommendations = predicted_activity_data['type']
+            actual_type_values = actual_activity_data['type'].iloc[0]
+            print(f"Type Recommendation Report for User {user_id}:")
+            print(classification_report([actual_type_values] * len(type_recommendations), type_recommendations))
+
+            # Evaluate place recommendation
+            place_recommendations = predicted_activity_data['place']
+            actual_place_values = actual_activity_data['place'].iloc[0]
+            print(f"Place Recommendation Report for User {user_id}:")
+            print(classification_report([actual_place_values] * len(place_recommendations), place_recommendations))
+
+            # Evaluate location recommendation
+            location_recommendations = predicted_activity_data['location']
+            actual_location_values = actual_activity_data['location'].iloc[0]
+            print(f"Location Recommendation Report for User {user_id}:")
+            print(classification_report([actual_location_values] * len(location_recommendations), location_recommendations))
+            print()
+
+        else:
+            print(f"No historical data found for predicted activity: {next_activity}")
+
+    return models
+
+def find_patterns(activity_data):
+    """
+    Find patterns in user activity sequences.
+    """
+    activity_sequences = activity_data['activity'].tolist()
+    type_sequences = activity_data['type'].tolist()
+    place_sequences = activity_data['place'].tolist()
+    location_sequences = activity_data['location'].tolist()
+
+    patterns = []
+    for i in range(len(activity_sequences)):
+        pattern = (activity_sequences[i], type_sequences[i], place_sequences[i], location_sequences[i])
+        patterns.append(pattern)
+
+    return patterns
+
+def rank_recommendations_based_on_pattern(predicted_activity, patterns):
+    """
+    Rank recommendations based on the pattern observed in historical data.
+    """
+    activity_counter = Counter()
+    type_counter = Counter()
+    place_counter = Counter()
+    location_counter = Counter()
+
+    for pattern in patterns:
+        if pattern[0] == predicted_activity:
+            activity_counter[pattern[0]] += 1
+            type_counter[pattern[1]] += 1
+            place_counter[pattern[2]] += 1
+            location_counter[pattern[3]] += 1
+
+    # Rank recommendations based on pattern frequency
+    ranked_activity = activity_counter.most_common(1)[0][0]
+    ranked_type = type_counter.most_common(1)[0][0]
+    ranked_place = place_counter.most_common(1)[0][0]
+    ranked_location = location_counter.most_common(1)[0][0]
+
+    return ranked_activity, ranked_type, ranked_place, ranked_location
+
+# Load data
+activity_data_user_A = pd.read_csv('modified_adls_A.csv', parse_dates=['Start time', 'End time'])
+sensor_data_user_A = pd.read_csv('modified_sensors_A.csv', parse_dates=['Start time', 'End time'])
+
+activity_data_user_B = pd.read_csv('modified_adls_B.csv', parse_dates=['Start time', 'End time'])
+sensor_data_user_B = pd.read_csv('modified_sensors_B.csv', parse_dates=['Start time', 'End time'])
+
+# Organize data
+users_data = [(activity_data_user_A, sensor_data_user_A), (activity_data_user_B, sensor_data_user_B)]
+
+# Train models, predict, and recommend
+models = train_predict_recommend(users_data)
+

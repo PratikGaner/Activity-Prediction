@@ -1,0 +1,213 @@
+import pandas as pd
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Read activity dataset from CSV
+activity_df = pd.read_csv('modified_adls_A.csv', parse_dates=['Start time', 'End time'])
+
+# Read sensor dataset from CSV
+sensor_df = pd.read_csv('modified_sensors_A.csv', parse_dates=['Start time', 'End time'])
+
+# Feature extraction from activity data
+activity_sequences = []
+for index, row in activity_df.iterrows():
+    activity_sequences.append({
+        'start_time': row['Start time'],
+        'end_time': row['End time'],
+        'activity': row['Activity']
+    })
+
+# Feature extraction from sensor data
+sensor_sequences = []
+for index, row in sensor_df.iterrows():
+    sensor_sequences.append({
+        'start_time': row['Start time'],
+        'end_time': row['End time'],
+        'location': row['Location'],
+        'type': row['Type'],
+        'place': row['Place']
+    })
+
+# Function to align sequences
+def align_sequences(activity_sequences, sensor_sequences):
+    aligned_sequences = []
+    for activity_seq in activity_sequences:
+        activity_start_time = activity_seq['start_time']
+        activity_end_time = activity_seq['end_time']
+        aligned_sensor_readings = []
+        for sensor_seq in sensor_sequences:
+            sensor_start_time = sensor_seq['start_time']
+            sensor_end_time = sensor_seq['end_time']
+            if sensor_start_time >= activity_start_time and sensor_end_time <= activity_end_time:
+                aligned_sensor_readings.append(sensor_seq)
+        if aligned_sensor_readings:
+            aligned_sequences.append({
+                'activity': activity_seq['activity'],
+                'activity_start_time': activity_start_time,
+                'activity_end_time': activity_end_time,
+                'sensor_readings': aligned_sensor_readings
+            })
+    return aligned_sequences
+
+# Align sequences
+aligned_sequences = align_sequences(activity_sequences, sensor_sequences)
+
+# Feature Engineering
+data = []
+for seq in aligned_sequences:
+    activity = seq['activity']
+    activity_start_time = seq['activity_start_time']
+    activity_end_time = seq['activity_end_time']
+    for sensor_reading in seq['sensor_readings']:
+        reading_start_time = sensor_reading['start_time']
+        reading_end_time = sensor_reading['end_time']
+        data.append({
+            'activity': activity,
+            'activity_start_time': activity_start_time,
+            'activity_end_time': activity_end_time,
+            'location': sensor_reading['location'],
+            'type': sensor_reading['type'],
+            'place': sensor_reading['place']
+        })
+
+df = pd.DataFrame(data)
+
+# One-hot encode categorical variables
+encoder = OneHotEncoder()
+encoded_features = encoder.fit_transform(df[['activity', 'location', 'type', 'place']])
+encoded_feature_names = encoder.get_feature_names_out(['activity', 'location', 'type', 'place'])
+encoded_df = pd.DataFrame(encoded_features.toarray(), columns=encoded_feature_names)
+
+# Concatenate encoded features with original DataFrame
+df = pd.concat([df, encoded_df], axis=1)
+
+# Select relevant features
+selected_features = ['activity_start_time', 'activity_end_time'] + list(encoded_feature_names)
+
+# Split data into features (X) and target (y)
+X = df[selected_features]
+y = df['activity']
+
+# Normalize numerical features
+scaler = StandardScaler()
+X.loc[:,['activity_start_time', 'activity_end_time']] = scaler.fit_transform(X[['activity_start_time', 'activity_end_time']])
+
+# Split the data into training, validation, and testing sets
+X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=0.2,stratify=y, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2,stratify=y_train_val, random_state=42)
+
+# Encode the target variable using label encoding
+label_encoder = LabelEncoder()
+y_train_encoded = label_encoder.fit_transform(y_train)
+y_val_encoded = label_encoder.transform(y_val)
+y_test_encoded = label_encoder.transform(y_test)
+
+# Convert the encoded target variables to appropriate data type
+y_train_encoded = y_train_encoded.astype('int32')
+y_val_encoded = y_val_encoded.astype('int32')
+y_test_encoded = y_test_encoded.astype('int32')
+
+# Convert y_train, y_val, y_test to one-hot encoding
+onehot_encoder = OneHotEncoder(sparse=False)
+y_train_onehot = onehot_encoder.fit_transform(y_train_encoded.reshape(-1, 1))
+y_val_onehot = onehot_encoder.transform(y_val_encoded.reshape(-1, 1))
+y_test_onehot = onehot_encoder.transform(y_test_encoded.reshape(-1, 1))
+
+# Reshape input data for LSTM
+X_train_reshaped = X_train.values.reshape(X_train.shape[0], X_train.shape[1], 1)
+X_val_reshaped = X_val.values.reshape(X_val.shape[0], X_val.shape[1], 1)
+X_test_reshaped = X_test.values.reshape(X_test.shape[0], X_test.shape[1], 1)
+
+# Define LSTM model
+model = Sequential([
+    LSTM(units=128, input_shape=(X_train_reshaped.shape[1], X_train_reshaped.shape[2])),
+    Dropout(0.2),
+    Dense(units=y_train_onehot.shape[1], activation='softmax')
+])
+
+# Compile model
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Define early stopping to prevent overfitting
+early_stopping = EarlyStopping(monitor='val_loss', patience=5)
+
+# Train model
+history = model.fit(X_train_reshaped, y_train_onehot,
+                    epochs=50,
+                    batch_size=32,
+                    validation_data=(X_val_reshaped, y_val_onehot),
+                    callbacks=[early_stopping])
+
+# Evaluate model on test set
+loss, accuracy = model.evaluate(X_test_reshaped, y_test_onehot)
+print(f'Test Loss: {loss}, Test Accuracy: {accuracy}')
+
+# Predict the activities on the test set
+y_pred_probabilities = model.predict(X_test_reshaped)
+y_pred = y_pred_probabilities.argmax(axis=1)
+y_pred_activity = label_encoder.inverse_transform(y_pred)
+
+# Create mappings from activity to type, place, and location
+activity_to_type = df.groupby('activity')['type'].agg(lambda x: x.value_counts().idxmax()).to_dict()
+activity_to_place = df.groupby('activity')['place'].agg(lambda x: x.value_counts().idxmax()).to_dict()
+activity_to_location = df.groupby('activity')['location'].agg(lambda x: x.value_counts().idxmax()).to_dict()
+
+# Generate recommendations based on the predicted activity
+recommendations = []
+for predicted_activity in y_pred_activity:
+    recommended_type = activity_to_type.get(predicted_activity, 'Unknown')
+    recommended_place = activity_to_place.get(predicted_activity, 'Unknown')
+    recommended_location = activity_to_location.get(predicted_activity, 'Unknown')
+    recommendations.append((predicted_activity, recommended_type, recommended_place, recommended_location))
+
+# Print the recommendations for a few test samples
+for i in range(3):
+    predicted_activity, recommended_type, recommended_place, recommended_location = recommendations[i]
+    print(f'Predicted Activity: {predicted_activity}, Recommended Type: {recommended_type}, Recommended Place: {recommended_place}, Recommended Location: {recommended_location}')
+
+
+
+# Print the actual activity, type, place, and location for a few test samples
+for i in range(3):
+    predicted_activity, recommended_type, recommended_place, recommended_location = recommendations[i]
+    actual_index = y_test.index[i]  # Get the index of the ith test sample
+    actual_activity = df.loc[actual_index, 'activity']
+    actual_type = df.loc[actual_index, 'type']
+    actual_place = df.loc[actual_index, 'place']
+    actual_location = df.loc[actual_index, 'location']
+
+    print(f'Test Sample {i+1}:')
+    print(f'Predicted Activity: {predicted_activity}, Recommended Type: {recommended_type}, Recommended Place: {recommended_place}, Recommended Location: {recommended_location}')
+    print(f'Actual Activity: {actual_activity}, Actual Type: {actual_type}, Actual Place: {actual_place}, Actual Location: {actual_location}')
+    print()
+
+
+from sklearn.metrics import classification_report
+
+# Convert y_test_encoded to activity labels
+y_test_labels = label_encoder.inverse_transform(y_test_encoded)
+
+# Classification report for predicted activities
+print("Classification Report for Predicted Activities:")
+print(classification_report(y_test_labels, y_pred_activity))
+
+# Extract actual types, places, and locations for the test samples
+actual_types = [df.loc[y_test.index[i], 'type'] for i in range(len(y_test))]
+actual_places = [df.loc[y_test.index[i], 'place'] for i in range(len(y_test))]
+actual_locations = [df.loc[y_test.index[i], 'location'] for i in range(len(y_test))]
+
+# Classification report for recommended types
+print("\nClassification Report for Recommended Types:")
+print(classification_report(actual_types, [rec[1] for rec in recommendations]))
+
+# Classification report for recommended places
+print("\nClassification Report for Recommended Places:")
+print(classification_report(actual_places, [rec[2] for rec in recommendations]))
+
+# Classification report for recommended locations
+print("\nClassification Report for Recommended Locations:")
+print(classification_report(actual_locations, [rec[3] for rec in recommendations]))

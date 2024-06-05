@@ -1,0 +1,109 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Read activity dataset from CSV
+activity_df = pd.read_csv('modified_adls_A.csv', parse_dates=['Start time', 'End time'])
+
+# Feature Engineering
+activity_df['start_hour'] = activity_df['Start time'].dt.hour
+activity_df['start_minute'] = activity_df['Start time'].dt.minute
+activity_df['start_second'] = activity_df['Start time'].dt.second
+activity_df['end_hour'] = activity_df['End time'].dt.hour
+activity_df['end_minute'] = activity_df['End time'].dt.minute
+activity_df['end_second'] = activity_df['End time'].dt.second
+activity_df['day_of_week'] = activity_df['Start time'].dt.dayofweek
+activity_df['is_weekend'] = activity_df['day_of_week'].isin([5, 6]).astype(int)
+
+# One-hot encode categorical variables
+encoder = OneHotEncoder()
+encoded_features = encoder.fit_transform(activity_df[['Activity']])
+encoded_feature_names = encoder.get_feature_names_out(['Activity'])
+encoded_df = pd.DataFrame(encoded_features.toarray(), columns=encoded_feature_names)
+
+# Concatenate encoded features with original DataFrame
+df = pd.concat([activity_df, encoded_df], axis=1)
+
+# Select relevant features
+selected_features = ['start_hour', 'start_minute', 'start_second', 'end_hour', 'end_minute', 
+                     'end_second', 'day_of_week', 'is_weekend'] + list(encoded_feature_names)
+
+# Split data into features (X) and target (y)
+X = df[selected_features]
+y = df['Activity']
+
+# Normalize numerical features
+scaler = StandardScaler()
+X[['start_hour', 'start_minute', 'start_second', 'end_hour', 'end_minute', 
+   'end_second', 'day_of_week']] = scaler.fit_transform(
+    X[['start_hour', 'start_minute', 'start_second', 'end_hour', 'end_minute', 
+       'end_second', 'day_of_week']]
+)
+
+# Split the data into training, validation, and testing sets
+X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, stratify=y_train_val, random_state=42)
+
+# Encode the target variable using label encoding
+label_encoder = LabelEncoder()
+y_train_encoded = label_encoder.fit_transform(y_train)
+y_val_encoded = label_encoder.transform(y_val)
+y_test_encoded = label_encoder.transform(y_test)
+
+# Convert the encoded target variables to appropriate data type
+y_train_encoded = y_train_encoded.astype('int32')
+y_val_encoded = y_val_encoded.astype('int32')
+y_test_encoded = y_test_encoded.astype('int32')
+
+# Convert y_train, y_val, y_test to one-hot encoding
+onehot_encoder = OneHotEncoder(sparse=False)
+y_train_onehot = onehot_encoder.fit_transform(y_train_encoded.reshape(-1, 1))
+y_val_onehot = onehot_encoder.transform(y_val_encoded.reshape(-1, 1))
+y_test_onehot = onehot_encoder.transform(y_test_encoded.reshape(-1, 1))
+
+# Reshape input data for LSTM
+X_train_reshaped = X_train.values.reshape(X_train.shape[0], X_train.shape[1], 1)
+X_val_reshaped = X_val.values.reshape(X_val.shape[0], X_val.shape[1], 1)
+X_test_reshaped = X_test.values.reshape(X_test.shape[0], X_test.shape[1], 1)
+
+# Define LSTM model
+model = Sequential([
+    LSTM(units=128, input_shape=(X_train_reshaped.shape[1], X_train_reshaped.shape[2])),
+    Dropout(0.2),
+    Dense(units=y_train_onehot.shape[1], activation='softmax')
+])
+
+# Compile model
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Define early stopping to prevent overfitting
+early_stopping = EarlyStopping(monitor='val_loss', patience=5)
+
+# Train model
+history = model.fit(X_train_reshaped, y_train_onehot,
+                    epochs=50,
+                    batch_size=32,
+                    validation_data=(X_val_reshaped, y_val_onehot),
+                    callbacks=[early_stopping])
+
+# Evaluate model on test set
+loss, accuracy = model.evaluate(X_test_reshaped, y_test_onehot)
+print(f'Test Loss: {loss}, Test Accuracy: {accuracy}')
+
+# Predict the activities on the test set
+y_pred_probabilities = model.predict(X_test_reshaped)
+y_pred = y_pred_probabilities.argmax(axis=1)
+y_pred_activity = label_encoder.inverse_transform(y_pred)
+
+# Print the predictions for a few test samples
+for i in range(2):
+    print(f'Predicted Activity: {y_pred_activity[i]}, Actual Activity: {y_test.iloc[i]}')
+
+# Generate classification report
+y_test_activity = label_encoder.inverse_transform(y_test_encoded)
+print(classification_report(y_test_activity, y_pred_activity))
