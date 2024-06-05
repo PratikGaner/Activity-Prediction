@@ -5,3 +5,4 @@
 2) The file name Activity_predicition_1_user_using_modified_adls_A.txt is used to predicit user next activity using only adls_A.txt file only.
 3) The file name Activity_predicition_1_user_using_modified_adls_A_and_modified_sensors_A.txt user both the activity dataset and sensors dataset for 1 user.
 4) The file name Activity_predicition_and recommendation_for_both_users.txt is overall predicition and recommendation for both users , using all the datasets.
+5) The file name Vizulaization.txt contains the confusion matrix, Training and validation loss plot and Training and validation accuracy
