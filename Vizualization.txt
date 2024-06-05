@@ -1,0 +1,100 @@
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+
+# Function to plot confusion matrix
+def plot_confusion_matrix(cm, classes, user_id):
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, cmap='Blues', fmt='g', xticklabels=classes, yticklabels=classes)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title(f'Confusion Matrix for User {user_id}')
+    plt.show()
+
+# Function to plot training and validation loss
+def plot_loss(history, user_id):
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title(f'Loss Plot for User {user_id}')
+    plt.legend()
+    plt.show()
+
+# Function to plot training and validation accuracy
+def plot_accuracy(history, user_id):
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.title(f'Accuracy Plot for User {user_id}')
+    plt.legend()
+    plt.show()
+
+# Loop through each user to generate confusion matrix
+for user_id, (activity_df, sensor_df) in enumerate(users_data, start=1):
+    # Preprocess data
+    combined_df = preprocess_data(activity_df, sensor_df, user_id)
+
+    # One-hot encode categorical features
+    encoder = OneHotEncoder()
+    encoded_features = encoder.fit_transform(combined_df[['activity', 'location', 'type', 'place']])
+    encoded_feature_names = encoder.get_feature_names_out(['activity', 'location', 'type', 'place'])
+    encoded_df = pd.DataFrame(encoded_features.toarray(), columns=encoded_feature_names)
+
+    combined_df = pd.concat([combined_df, encoded_df], axis=1)
+
+    selected_features = ['user_id', 'activity_start_time', 'activity_end_time'] + list(encoded_feature_names)
+
+    X = combined_df[selected_features]
+    y = combined_df['activity']
+
+    scaler = StandardScaler()
+    X.loc[:,['activity_start_time', 'activity_end_time']] = scaler.fit_transform(X[['activity_start_time', 'activity_end_time']])
+
+    # Train-test split
+    X_train, X_val, y_train, y_val = train_test_split(X.drop(columns=['user_id']), y, test_size=0.2, stratify=y, random_state=42)
+
+    label_encoder = LabelEncoder()
+    y_train_encoded = label_encoder.fit_transform(y_train)
+    y_val_encoded = label_encoder.transform(y_val)
+
+    # Calculate weights for each class based on their frequency
+    class_weights = compute_class_weights(y_train_encoded)
+
+    # Define model architecture
+    model = Sequential([
+        LSTM(units=128, input_shape=(X_train.shape[1], 1)),
+        Dropout(0.2),
+        Dense(units=len(np.unique(y)), activation='softmax')
+    ])
+
+    # Compile model
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+    # Train model
+    history = model.fit(X_train.values.reshape(X_train.shape[0], X_train.shape[1], 1), y_train_encoded,
+                        epochs=50,
+                        batch_size=32,
+                        class_weight=class_weights,
+                        validation_data=(X_val.values.reshape(X_val.shape[0], X_val.shape[1], 1), y_val_encoded))
+
+    # Get predictions on validation data
+    y_val_pred = model.predict(X_val.values.reshape(X_val.shape[0], X_val.shape[1], 1))
+    y_val_pred = np.argmax(y_val_pred, axis=1)
+
+    # Inverse transform encoded labels to original labels
+    y_val_true = label_encoder.inverse_transform(y_val_encoded)
+    y_val_pred = label_encoder.inverse_transform(y_val_pred)
+
+    # Generate confusion matrix
+    cm = confusion_matrix(y_val_true, y_val_pred)
+
+    # Plot confusion matrix
+    plot_confusion_matrix(cm, np.unique(y), user_id)
+
+    # Plot training and validation loss
+    plot_loss(history, user_id)
+
+    # Plot training and validation accuracy
+    plot_accuracy(history, user_id)
